@@ -53,11 +53,16 @@ const PROVIDER_TTLS_MS: Record<SupportedQuotaProvider, number> = {
  * - On any failure the caller receives lastSuccess (stale) when available,
  *   so the footer never shows “usage unavailable” just because one refresh
  *   hit a transient error.
+ * - lastFailure stores the most recent failure when there is no known-good
+ *   snapshot, so a burst of polls (or a repeated /quotas command) reuses one
+ *   contained failure instead of re-hitting a failing endpoint.
  * - rateLimitedUntil prevents hammering the endpoint after a 429.
  */
 type CacheEntry = {
   lastSuccess?: QuotasResult;
   lastSuccessAt?: number;
+  lastFailure?: QuotasResult;
+  lastFailureAt?: number;
   /** Set on 429 — don’t retry until this timestamp. */
   rateLimitedUntil?: number;
   inFlight?: Promise<QuotasResult>;
@@ -144,6 +149,19 @@ export async function fetchProviderQuotas(
 
   if (!options?.force && entry.inFlight) return entry.inFlight;
 
+  // Fresh failure with nothing better to show — reuse it. Without this, every
+  // poll would re-hit a failing endpoint and hand back a brand new failure
+  // object, which also breaks the "cached like any other result" contract.
+  if (
+    !options?.force &&
+    !entry.lastSuccess &&
+    entry.lastFailure &&
+    entry.lastFailureAt &&
+    now - entry.lastFailureAt < ttl
+  ) {
+    return entry.lastFailure;
+  }
+
   const promise = PROVIDER_FETCHERS[provider](authStorage, options?.signal)
     .catch((err: unknown) => toFailureResult(provider, err))
     .then((result: QuotasResult) => {
@@ -163,6 +181,19 @@ export async function fetchProviderQuotas(
         result.error.kind === "rate_limited"
           ? Date.now() + RATE_LIMIT_BACKOFF_MS
           : undefined;
+
+      // A stale last-good snapshot always wins over a fresh failure. Only
+      // memoize the failure when it is the best information we have.
+      if (!entry.lastSuccess) {
+        cache.set(provider, {
+          ...entry,
+          lastFailure: result,
+          lastFailureAt: Date.now(),
+          ...(rateLimitedUntil ? { rateLimitedUntil } : {}),
+        });
+        return result;
+      }
+
       cache.set(provider, {
         ...entry,
         ...(rateLimitedUntil ? { rateLimitedUntil } : {}),
